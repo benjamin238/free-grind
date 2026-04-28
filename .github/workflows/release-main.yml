@@ -40,10 +40,11 @@ jobs:
         run: |
           # Find the tag of the most recent published release
           PREV_TAG=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 1 --json tagName --jq '.[0].tagName // ""')
+          GIT_FORMAT="- %s (%h)"
           if [ -n "$PREV_TAG" ]; then
-            LOG=$(git log "${PREV_TAG}..HEAD" --pretty=format:"- %s (%h)" --no-merges | head -100)
+            LOG=$(git log "${PREV_TAG}..HEAD" --pretty=format:"$GIT_FORMAT" --no-merges | head -100)
           else
-            LOG=$(git log --pretty=format:"- %s (%h)" --no-merges | head -100)
+            LOG=$(git log --pretty=format:"$GIT_FORMAT" --no-merges | head -100)
           fi
           # Write to a file to avoid quoting issues with multiline env vars
           printf '%s' "$LOG" > /tmp/commit_log.txt
@@ -54,10 +55,15 @@ jobs:
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
+          FALLBACK='Automated release generated from a push to `main`.'
           COMMITS=$(cat /tmp/commit_log.txt)
-          if [ -z "$COMMITS" ]; then
+
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "OPENAI_API_KEY secret is not set; using fallback description."
+            printf '%s' "$FALLBACK" > /tmp/release_body.txt
+          elif [ -z "$COMMITS" ]; then
             echo "No commits found; using fallback description."
-            printf 'Automated release generated from a push to `main`.' > /tmp/release_body.txt
+            printf '%s' "$FALLBACK" > /tmp/release_body.txt
           else
             PAYLOAD=$(jq -n \
               --arg commits "$COMMITS" \
@@ -66,7 +72,7 @@ jobs:
                 messages: [
                   {
                     role: "system",
-                    content: "You are a helpful assistant that writes concise, user-friendly release notes for a desktop/mobile productivity app called Open Grind. Summarise the changes in plain English, grouped by theme where possible. Use markdown bullet points. Do not include a title heading."
+                    content: "You are a helpful assistant that writes concise, user-friendly release notes for a desktop/mobile productivity app called Open Grind. Summarize the changes in plain English, grouped by theme where possible. Use markdown bullet points. Do not include a title heading."
                   },
                   {
                     role: "user",
@@ -75,15 +81,21 @@ jobs:
                 ],
                 max_tokens: 512
               }')
-            RESPONSE=$(curl -s https://api.openai.com/v1/chat/completions \
+            HTTP_STATUS=$(curl -s -o /tmp/openai_response.json -w "%{http_code}" \
+              https://api.openai.com/v1/chat/completions \
               -H "Content-Type: application/json" \
               -H "Authorization: Bearer ${OPENAI_API_KEY}" \
               -d "$PAYLOAD")
-            AI_BODY=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // ""')
-            if [ -z "$AI_BODY" ]; then
-              printf 'Automated release generated from a push to `main`.' > /tmp/release_body.txt
+            if [ "$HTTP_STATUS" != "200" ]; then
+              echo "OpenAI API returned HTTP ${HTTP_STATUS}; using fallback description."
+              printf '%s' "$FALLBACK" > /tmp/release_body.txt
             else
-              printf '%s' "$AI_BODY" > /tmp/release_body.txt
+              AI_BODY=$(jq -r '.choices[0].message.content // ""' /tmp/openai_response.json)
+              if [ -z "$AI_BODY" ]; then
+                printf '%s' "$FALLBACK" > /tmp/release_body.txt
+              else
+                printf '%s' "$AI_BODY" > /tmp/release_body.txt
+              fi
             fi
           fi
 
